@@ -352,17 +352,38 @@ def main() -> None:
     panel.to_csv(PANEL_CSV, index=False, encoding="utf-8-sig")
     panel.to_parquet(PANEL_PARQUET, index=False)
 
+    # Diagnosticos de qualidade dos joins frageis (Registro Civil e Censo 2010
+    # sao unidos por nome normalizado dentro da UF, portanto podem ter perdas).
+    expected_rows = len(YEARS) * int(panel["cd_mun"].nunique())
+    if len(panel) != expected_rows:
+        raise RuntimeError(
+            f"Painel tem {len(panel)} linhas, esperado {expected_rows} "
+            f"({panel['cd_mun'].nunique()} municipios x {len(YEARS)} anos)."
+        )
+    muni_zero_births = int(
+        panel.groupby("cd_mun")["nascimentos"].sum().eq(0).sum()
+    )
+    muni_sem_censo = int(panel.loc[panel["pop_total_2010"].isna(), "cd_mun"].nunique())
+
     metadata = {
         "years": [PANEL_YEAR_START, PANEL_YEAR_END],
         "rows": int(len(panel)),
         "municipios": int(panel["cd_mun"].nunique()),
         "treated_ever": int(panel.drop_duplicates("cd_mun")["ever_treated"].sum()),
         "variables": list(panel.columns),
+        "diagnosticos_qualidade": {
+            "municipios_com_zero_nascimentos_todos_anos": muni_zero_births,
+            "municipios_sem_pareamento_censo_2010": muni_sem_censo,
+            "municipios_no_semiarido": int(
+                panel.drop_duplicates("cd_mun")["semi_dum"].sum()
+            ),
+        },
         "notes": [
             "Tratamento anual definido por presenca de eolica no municipio com base na data de entrada em operacao da ANEEL.",
             "Covariadas do Censo 2010 mantidas parcimoniosas: populacao total e participacao rural.",
             "Velocidade media do vento municipal medida pela media dos pontos do CEPEL a 100m.",
             "Painel construido sem exclusoes amostrais.",
+            "Registro Civil (ARPEN/transparencia.registrocivil.org.br) e Censo 2010 sao unidos por nome municipal normalizado dentro da UF; consulte diagnosticos_qualidade para monitorar perdas.",
         ],
     }
     PANEL_METADATA.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
