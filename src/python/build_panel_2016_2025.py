@@ -1,0 +1,402 @@
+from __future__ import annotations
+
+import io
+import json
+import subprocess
+import zipfile
+from pathlib import Path
+from urllib.parse import urlencode
+
+import geopandas as gpd
+import pandas as pd
+
+from pipeline_config import (
+    DATA_PROCESSED_DIR,
+    DATA_RAW_DIR,
+    NORTHEAST_UFS,
+    RAW_ANEEL_CSV,
+    RAW_GEOBR_DIR,
+    RAW_WIND_KMZ,
+    SEMIARIDO_MUNICIPAL_SHP,
+    WIND_FIELDS,
+    WIND_LAYER,
+)
+from pipeline_utils import normalize_text, parse_description_table, parse_ptbr_number
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+REGCIV_RAW_DIR = DATA_RAW_DIR / "registro_civil_painel_anual"
+PANEL_OUT_DIR = DATA_PROCESSED_DIR / "panel"
+PANEL_CSV = PANEL_OUT_DIR / "painel_municipio_ano_2016_2025.csv"
+PANEL_PARQUET = PANEL_OUT_DIR / "painel_municipio_ano_2016_2025.parquet"
+PANEL_METADATA = PANEL_OUT_DIR / "painel_municipio_ano_2016_2025_metadata.json"
+
+YEARS = list(range(2016, 2026))
+REGISTRY_BASE_URL = "https://transparencia.registrocivil.org.br/api"
+
+
+def ensure_dirs() -> None:
+    REGCIV_RAW_DIR.mkdir(parents=True, exist_ok=True)
+    PANEL_OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def fetch_csv_text(endpoint: str, params: dict[str, str]) -> str:
+    url = f"{REGISTRY_BASE_URL}/{endpoint}?{urlencode(params)}"
+    result = subprocess.run(
+        ["curl.exe", "-s", "-L", url],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout
+
+
+def load_municipal_base() -> gpd.GeoDataFrame:
+    frames = []
+    for uf in NORTHEAST_UFS:
+        shp_path = RAW_GEOBR_DIR / uf / f"{uf}_Municipios_2025.shp"
+        frames.append(gpd.read_file(shp_path))
+    gdf = gpd.GeoDataFrame(pd.concat(frames, ignore_index=True), crs=frames[0].crs)
+    gdf = gdf.rename(
+        columns={
+            "CD_MUN": "cd_mun",
+            "NM_MUN": "nm_mun",
+            "CD_UF": "cd_uf",
+            "SIGLA_UF": "sigla_uf",
+            "NM_UF": "nm_uf",
+            "AREA_KM2": "area_km2",
+        }
+    )
+    gdf["cd_mun"] = gdf["cd_mun"].astype(str).str.zfill(7)
+    gdf["nm_mun_norm"] = gdf["nm_mun"].apply(normalize_text)
+    return gdf
+
+
+def load_semiarido_status() -> pd.DataFrame:
+    semi = gpd.read_file(SEMIARIDO_MUNICIPAL_SHP)
+    semi = semi.rename(columns={"CD_GEOCMU": "cd_mun", "Semiarido": "semi_txt"})
+    semi["cd_mun"] = semi["cd_mun"].astype(str).str.zfill(7)
+    semi["semiarido"] = semi["semi_txt"].fillna("").str.upper().eq("SIM").astype(int)
+    return semi[["cd_mun", "semiarido"]].drop_duplicates()
+
+
+def load_wind_points() -> gpd.GeoDataFrame:
+    wind = gpd.read_file(RAW_WIND_KMZ, layer=WIND_LAYER)
+    parsed = pd.DataFrame(wind["description"].apply(parse_description_table).tolist())
+    parsed = parsed[["LAT", "LONG"] + WIND_FIELDS].copy()
+    for col in ["LAT", "LONG"] + WIND_FIELDS:
+        parsed[col] = pd.to_numeric(parsed[col], errors="coerce")
+    out = gpd.GeoDataFrame(
+        pd.concat([wind[["Name"]].reset_index(drop=True), parsed.reset_index(drop=True)], axis=1),
+        geometry=wind.geometry,
+        crs=wind.crs,
+    )
+    return out.rename(columns={"Name": "wind_cell"}).dropna(subset=["geometry"])
+
+
+def aggregate_wind_to_municipality(municipal: gpd.GeoDataFrame) -> pd.DataFrame:
+    joined = gpd.sjoin(
+        load_wind_points().to_crs(municipal.crs),
+        municipal[["cd_mun", "geometry"]],
+        how="inner",
+        predicate="within",
+    )
+    return joined.groupby("cd_mun").agg(wind_v100=("V_100m", "mean")).reset_index()
+
+
+def load_aneel_points() -> gpd.GeoDataFrame:
+    aneel = pd.read_csv(RAW_ANEEL_CSV, sep=";", dtype=str, encoding="latin1")
+    aneel = aneel[(aneel["SigTipoGeracao"] == "EOL") & (aneel["SigUFPrincipal"].isin(NORTHEAST_UFS))].copy()
+
+    aneel["lat"] = aneel["NumCoordNEmpreendimento"].apply(parse_ptbr_number)
+    aneel["lon"] = aneel["NumCoordEEmpreendimento"].apply(parse_ptbr_number)
+    aneel["pot_out_kw"] = aneel["MdaPotenciaOutorgadaKw"].apply(parse_ptbr_number)
+    aneel["pot_fisc_kw"] = aneel["MdaPotenciaFiscalizadaKw"].apply(parse_ptbr_number)
+    aneel["gar_fis_kw"] = aneel["MdaGarantiaFisicaKw"].apply(parse_ptbr_number)
+    aneel["dat_oper"] = pd.to_datetime(aneel["DatEntradaOperacao"], errors="coerce")
+    aneel["ano_oper"] = aneel["dat_oper"].dt.year
+
+    aneel = aneel.dropna(subset=["lat", "lon"]).copy()
+    geom = gpd.points_from_xy(aneel["lon"], aneel["lat"], crs="EPSG:4326")
+    return gpd.GeoDataFrame(aneel, geometry=geom)
+
+
+def build_eolica_flags(municipal: gpd.GeoDataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    points = load_aneel_points().to_crs(municipal.crs)
+    joined = gpd.sjoin(points, municipal[["cd_mun", "geometry"]], how="inner", predicate="within")
+
+    yearly_rows = []
+    for year in YEARS:
+        active = joined[(joined["ano_oper"].notna()) & (joined["ano_oper"] <= year)]
+        agg = (
+            active.groupby("cd_mun")
+            .agg(
+                eolica_presenca=("CodCEG", "count"),
+                eolica_pot_out_kw=("pot_out_kw", "sum"),
+                eolica_pot_fisc_kw=("pot_fisc_kw", "sum"),
+            )
+            .reset_index()
+        )
+        agg["ano"] = year
+        agg["eolica_presenca"] = (agg["eolica_presenca"] > 0).astype(int)
+        yearly_rows.append(agg)
+
+    yearly = pd.concat(yearly_rows, ignore_index=True) if yearly_rows else pd.DataFrame()
+
+    first_year = (
+        joined.loc[joined["ano_oper"].notna(), ["cd_mun", "ano_oper"]]
+        .groupby("cd_mun", as_index=False)["ano_oper"]
+        .min()
+        .rename(columns={"ano_oper": "ano_primeira_eolica"})
+    )
+    first_year["eolica_pre2016"] = (first_year["ano_primeira_eolica"] < 2016).astype(int)
+    return yearly, first_year
+
+
+def build_spillover_50km(municipal: gpd.GeoDataFrame) -> pd.DataFrame:
+    muni_metric = municipal.to_crs(5880)
+    centroids = muni_metric.copy()
+    centroids["geometry"] = centroids.geometry.centroid
+
+    points = load_aneel_points()
+    pre2016 = points[(points["ano_oper"].notna()) & (points["ano_oper"] < 2016)].to_crs(5880)
+    if pre2016.empty:
+        return centroids[["cd_mun"]].assign(eolica_pre2016_50km=0)
+
+    buffers = pre2016[["geometry"]].copy()
+    buffers["geometry"] = buffers.geometry.buffer(50000)
+    union_geom = buffers.union_all()
+    centroids["eolica_pre2016_50km"] = centroids.geometry.within(union_geom).astype(int)
+    return centroids[["cd_mun", "eolica_pre2016_50km"]]
+
+
+def download_pais_ausentes_year(year: int, uf: str) -> pd.DataFrame:
+    out_path = REGCIV_RAW_DIR / f"father_off_{uf}_{year}.csv"
+    if out_path.exists():
+        df = pd.read_csv(out_path)
+        df["uf"] = uf
+        df["ano"] = year
+        return df
+    params = {
+        "data_inicial": f"{year}-01-01",
+        "data_final": f"{year}-12-31",
+        "groupBy": "cidade",
+        "uf": uf,
+        "csv": "true",
+    }
+    text = fetch_csv_text("father-off", params)
+    out_path.write_text(text, encoding="utf-8")
+    df = pd.read_csv(io.StringIO(text))
+    df["uf"] = uf
+    df["ano"] = year
+    return df
+
+
+def download_reconhecimento_year(year: int, uf: str) -> pd.DataFrame:
+    out_path = REGCIV_RAW_DIR / f"father_on_{uf}_{year}.csv"
+    if out_path.exists():
+        df = pd.read_csv(out_path)
+        df["uf"] = uf
+        return df
+    params = {
+        "data_inicial": f"{year}-01-01",
+        "data_final": f"{year}-12-31",
+        "groupBy": "cidade",
+        "uf": uf,
+        "csv": "true",
+    }
+    text = fetch_csv_text("father-on", params)
+    out_path.write_text(text, encoding="utf-8")
+    df = pd.read_csv(io.StringIO(text))
+    df["uf"] = uf
+    return df
+
+
+def build_registry_panel(municipal: gpd.GeoDataFrame) -> pd.DataFrame:
+    off_frames = []
+    on_frames = []
+    for year in YEARS:
+        for uf in NORTHEAST_UFS:
+            off_frames.append(download_pais_ausentes_year(year, uf))
+            on_frames.append(download_reconhecimento_year(year, uf))
+
+    father_off = pd.concat(off_frames, ignore_index=True)
+    father_off = father_off.rename(columns={"Estado": "municipio", "qt_pais_ausente": "pais_ausentes", "qt_nascimento": "nascimentos"})
+    father_off["municipio_norm"] = father_off["municipio"].apply(normalize_text)
+    father_off["pais_ausentes"] = pd.to_numeric(father_off["pais_ausentes"], errors="coerce")
+    father_off["nascimentos"] = pd.to_numeric(father_off["nascimentos"], errors="coerce")
+
+    father_on = pd.concat(on_frames, ignore_index=True)
+    father_on = father_on.rename(columns={"Estado": "municipio", "qt_reconhecimento_paternidade": "reconhecimento_paternidade"})
+    father_on["municipio_norm"] = father_on["municipio"].apply(normalize_text)
+    father_on["reconhecimento_paternidade"] = pd.to_numeric(father_on["reconhecimento_paternidade"], errors="coerce")
+    father_on["ano"] = pd.to_numeric(father_on["ano"], errors="coerce")
+    father_on = father_on.groupby(["uf", "municipio_norm", "ano"], as_index=False)["reconhecimento_paternidade"].sum()
+
+    muni_lookup = municipal[["cd_mun", "sigla_uf", "nm_mun_norm"]].drop_duplicates().rename(columns={"sigla_uf": "uf", "nm_mun_norm": "municipio_norm"})
+
+    father_off = father_off.merge(muni_lookup, on=["uf", "municipio_norm"], how="left")
+    father_on = father_on.merge(muni_lookup, on=["uf", "municipio_norm"], how="left")
+
+    base = pd.MultiIndex.from_product([municipal["cd_mun"].sort_values().unique(), YEARS], names=["cd_mun", "ano"]).to_frame(index=False)
+    base = base.merge(municipal[["cd_mun", "nm_mun", "sigla_uf", "area_km2"]].drop_duplicates(), on="cd_mun", how="left")
+
+    panel = base.merge(father_off[["cd_mun", "ano", "pais_ausentes", "nascimentos"]], on=["cd_mun", "ano"], how="left")
+    panel = panel.merge(father_on[["cd_mun", "ano", "reconhecimento_paternidade"]], on=["cd_mun", "ano"], how="left")
+    panel["pais_ausentes"] = panel["pais_ausentes"].fillna(0)
+    panel["nascimentos"] = panel["nascimentos"].fillna(0)
+    panel["reconhecimento_paternidade"] = panel["reconhecimento_paternidade"].fillna(0)
+    return panel
+
+
+def extract_censo_covariates() -> pd.DataFrame:
+    mapping = {
+        "AL": "alagoas.zip",
+        "BA": "bahia.zip",
+        "CE": "ceara.zip",
+        "MA": "maranhao.zip",
+        "PB": "paraiba.zip",
+        "PE": "pernambuco.zip",
+        "PI": "piaui.zip",
+        "RN": "rio_grande_do_norte.zip",
+        "SE": "sergipe.zip",
+    }
+
+    rows = []
+    for uf, filename in mapping.items():
+        zip_path = DATA_RAW_DIR / "censo_2010" / "resultados_universo_municipios" / filename
+        with zipfile.ZipFile(zip_path) as zf:
+            target = next(name for name in zf.namelist() if name.endswith(".1.1.xls"))
+            data = io.BytesIO(zf.read(target))
+            df = pd.read_excel(data, sheet_name=0, header=None)
+        df = df.iloc[13:].copy()
+        df = df[[0, 1, 4, 7, 10]].copy()
+        df.columns = ["nome", "pop_total", "pop_urbana", "pop_rural", "cd_raw"]
+        df = df[df["cd_raw"].notna()].copy()
+        df["cd_raw"] = pd.to_numeric(df["cd_raw"], errors="coerce")
+        df = df[df["cd_raw"] >= 100000].copy()
+        rows.append(df.assign(uf=uf))
+
+    censo = pd.concat(rows, ignore_index=True)
+    return censo
+
+
+def harmonize_censo_with_municipal(censo: pd.DataFrame, municipal: gpd.GeoDataFrame) -> pd.DataFrame:
+    muni = municipal[["cd_mun", "sigla_uf", "nm_mun_norm"]].drop_duplicates()
+    censo["nm_mun_norm"] = censo["nome"].apply(normalize_text)
+    merged = censo.merge(muni, left_on=["uf", "nm_mun_norm"], right_on=["sigla_uf", "nm_mun_norm"], how="left")
+    merged["pop_total_2010"] = pd.to_numeric(merged["pop_total"], errors="coerce")
+    merged["pop_urbana_2010"] = pd.to_numeric(merged["pop_urbana"], errors="coerce")
+    merged["pop_rural_2010"] = pd.to_numeric(merged["pop_rural"], errors="coerce")
+    merged["share_rural_2010"] = merged["pop_rural_2010"] / merged["pop_total_2010"]
+    merged = merged[["cd_mun", "pop_total_2010", "pop_urbana_2010", "pop_rural_2010", "share_rural_2010"]].dropna(subset=["cd_mun"])
+    return merged.drop_duplicates(subset=["cd_mun"])
+
+
+def main() -> None:
+    ensure_dirs()
+    municipal = load_municipal_base()
+
+    registry = build_registry_panel(municipal)
+    wind = aggregate_wind_to_municipality(municipal)
+    semiarido = load_semiarido_status()
+    eolica_yearly, eolica_first = build_eolica_flags(municipal)
+    spill = build_spillover_50km(municipal)
+    censo = harmonize_censo_with_municipal(extract_censo_covariates(), municipal)
+
+    panel = registry.merge(semiarido, on="cd_mun", how="left")
+    panel = panel.merge(wind, on="cd_mun", how="left")
+    panel = panel.merge(eolica_yearly, on=["cd_mun", "ano"], how="left")
+    panel = panel.merge(eolica_first, on="cd_mun", how="left")
+    panel = panel.merge(spill, on="cd_mun", how="left")
+    panel = panel.merge(censo, on="cd_mun", how="left")
+
+    panel["semiarido"] = panel["semiarido"].fillna(0).astype(int)
+    panel["eolica_presenca"] = panel["eolica_presenca"].fillna(0).astype(int)
+    panel["eolica_pot_out_kw"] = panel["eolica_pot_out_kw"].fillna(0)
+    panel["eolica_pot_fisc_kw"] = panel["eolica_pot_fisc_kw"].fillna(0)
+    panel["eolica_pre2016"] = panel["eolica_pre2016"].fillna(0).astype(int)
+    panel["eolica_pre2016_50km"] = panel["eolica_pre2016_50km"].fillna(0).astype(int)
+    panel["ever_treated"] = panel["ano_primeira_eolica"].notna().astype(int)
+    panel["event_time"] = panel["ano"] - panel["ano_primeira_eolica"]
+    panel.loc[panel["ano_primeira_eolica"].isna(), "event_time"] = pd.NA
+    panel["tx_pais_ausentes_1000"] = panel["pais_ausentes"] / panel["nascimentos"].where(panel["nascimentos"] > 0) * 1000
+    panel["tx_reconhecimento_1000"] = panel["reconhecimento_paternidade"] / panel["nascimentos"].where(panel["nascimentos"] > 0) * 1000
+
+    panel = panel[[
+        "cd_mun",
+        "nm_mun",
+        "sigla_uf",
+        "ano",
+        "pais_ausentes",
+        "reconhecimento_paternidade",
+        "nascimentos",
+        "tx_pais_ausentes_1000",
+        "tx_reconhecimento_1000",
+        "semiarido",
+        "eolica_presenca",
+        "eolica_pot_out_kw",
+        "eolica_pot_fisc_kw",
+        "ano_primeira_eolica",
+        "eolica_pre2016",
+        "eolica_pre2016_50km",
+        "ever_treated",
+        "event_time",
+        "wind_v100",
+        "pop_total_2010",
+        "share_rural_2010",
+        "area_km2",
+    ]]
+
+    panel = (
+        panel.groupby(["cd_mun", "ano"], as_index=False)
+        .agg(
+            nm_mun=("nm_mun", "first"),
+            sigla_uf=("sigla_uf", "first"),
+            pais_ausentes=("pais_ausentes", "first"),
+            reconhecimento_paternidade=("reconhecimento_paternidade", "first"),
+            nascimentos=("nascimentos", "first"),
+            tx_pais_ausentes_1000=("tx_pais_ausentes_1000", "first"),
+            tx_reconhecimento_1000=("tx_reconhecimento_1000", "first"),
+            semiarido=("semiarido", "first"),
+            eolica_presenca=("eolica_presenca", "first"),
+            eolica_pot_out_kw=("eolica_pot_out_kw", "first"),
+            eolica_pot_fisc_kw=("eolica_pot_fisc_kw", "first"),
+            ano_primeira_eolica=("ano_primeira_eolica", "first"),
+            eolica_pre2016=("eolica_pre2016", "first"),
+            eolica_pre2016_50km=("eolica_pre2016_50km", "first"),
+            ever_treated=("ever_treated", "first"),
+            event_time=("event_time", "first"),
+            wind_v100=("wind_v100", "first"),
+            pop_total_2010=("pop_total_2010", "first"),
+            share_rural_2010=("share_rural_2010", "first"),
+            area_km2=("area_km2", "first"),
+        )
+        .sort_values(["cd_mun", "ano"])
+    )
+
+    panel.to_csv(PANEL_CSV, index=False, encoding="utf-8-sig")
+    panel.to_parquet(PANEL_PARQUET, index=False)
+
+    metadata = {
+        "years": [2016, 2025],
+        "rows": int(len(panel)),
+        "municipios": int(panel["cd_mun"].nunique()),
+        "treated_ever": int(panel.drop_duplicates("cd_mun")["ever_treated"].sum()),
+        "variables": list(panel.columns),
+        "notes": [
+            "Tratamento anual definido por presenca de eolica no municipio com base na data de entrada em operacao da ANEEL.",
+            "Covariadas do Censo 2010 mantidas parcimoniosas: populacao total e participacao rural.",
+            "Velocidade media do vento municipal medida pela media dos pontos do CEPEL a 100m.",
+            "Painel construido sem exclusoes amostrais.",
+        ],
+    }
+    PANEL_METADATA.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print(f"Painel salvo em: {PANEL_CSV}")
+    print(f"Linhas: {len(panel)}")
+    print(f"Municipios: {panel['cd_mun'].nunique()}")
+
+
+if __name__ == "__main__":
+    main()
