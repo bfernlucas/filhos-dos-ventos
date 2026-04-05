@@ -36,6 +36,20 @@ Unidade de observacao:
 - `share_rural_2010`: participacao da populacao rural no Censo 2010.
 - `area_km2`: area municipal em quilometros quadrados.
 
+## Estrategia de pareamento (merge)
+
+- **Censo 2010 -> IBGE 2025**: cruzamento deterministico pelo codigo IBGE
+  (`cd_raw` de 6 digitos da planilha .1.1.xls == primeiros 6 digitos do
+  `cd_mun` de 7 digitos). Sem perdas por grafia.
+- **Registro Civil (ARPEN) -> IBGE 2025**: match exato por nome municipal
+  normalizado dentro da UF e, para o residuo, match aproximado via
+  RapidFuzz (`WRatio`, limiar 88/100) dentro da mesma UF. Cada par fuzzy
+  aceito e registrado no metadata (`diagnosticos_qualidade.merge_reports`)
+  para auditoria.
+- **Pontos ANEEL e CEPEL -> IBGE 2025**: spatial join por coordenadas
+  (within). Nao depende de nome.
+- **SUDENE -> IBGE 2025**: join por `cd_mun` (7 digitos). Deterministico.
+
 ## Uso econometrico sugerido
 
 Chaves de merge:

@@ -26,6 +26,16 @@ from build_spatial_base import (
     load_wind_points,
 )
 from pipeline_utils import http_get_text, normalize_text
+from merge_utils import (
+    MergeReport,
+    censo_crosswalk_by_ibge_code,
+    fuzzy_merge_names_within_uf,
+)
+
+
+# Relatorios globais preenchidos durante a construcao do painel para serem
+# serializados no metadata. Permitem auditar matches fuzzy linha a linha.
+_MERGE_REPORTS: dict[str, MergeReport] = {}
 
 
 REGCIV_RAW_DIR = DATA_RAW_DIR / "registro_civil_painel_anual"
@@ -180,6 +190,33 @@ def download_reconhecimento_year(year: int, uf: str) -> pd.DataFrame:
     return df
 
 
+def _merge_registry_names(
+    frame: pd.DataFrame, municipal: gpd.GeoDataFrame, name_col: str, report_key: str
+) -> pd.DataFrame:
+    """Une uma fonte do Registro Civil a malha IBGE por nome (exato + fuzzy).
+
+    O Registro Civil (ARPEN) so publica o nome do municipio. Usamos match
+    exato por nome normalizado dentro da UF e, para o residuo, um match
+    aproximado via RapidFuzz. Os pares fuzzy ficam registrados em
+    ``_MERGE_REPORTS`` para auditoria posterior no metadata.
+    """
+    muni_lookup = (
+        municipal[["cd_mun", "sigla_uf", "nm_mun"]]
+        .drop_duplicates()
+        .rename(columns={"sigla_uf": "uf"})
+    )
+    frame = frame.rename(columns={"uf": "uf"})  # noop, explicita a coluna
+    merged, report = fuzzy_merge_names_within_uf(
+        left=frame,
+        right=muni_lookup,
+        left_name=name_col,
+        right_name="nm_mun",
+        uf_col="uf",
+    )
+    _MERGE_REPORTS[report_key] = report
+    return merged
+
+
 def build_registry_panel(municipal: gpd.GeoDataFrame) -> pd.DataFrame:
     off_frames = []
     on_frames = []
@@ -189,28 +226,69 @@ def build_registry_panel(municipal: gpd.GeoDataFrame) -> pd.DataFrame:
             on_frames.append(download_reconhecimento_year(year, uf))
 
     father_off = pd.concat(off_frames, ignore_index=True)
-    father_off = father_off.rename(columns={"Estado": "municipio", "qt_pais_ausente": "pais_ausentes", "qt_nascimento": "nascimentos"})
-    father_off["municipio_norm"] = father_off["municipio"].apply(normalize_text)
+    father_off = father_off.rename(
+        columns={
+            "Estado": "municipio",
+            "qt_pais_ausente": "pais_ausentes",
+            "qt_nascimento": "nascimentos",
+        }
+    )
     father_off["pais_ausentes"] = pd.to_numeric(father_off["pais_ausentes"], errors="coerce")
     father_off["nascimentos"] = pd.to_numeric(father_off["nascimentos"], errors="coerce")
 
     father_on = pd.concat(on_frames, ignore_index=True)
-    father_on = father_on.rename(columns={"Estado": "municipio", "qt_reconhecimento_paternidade": "reconhecimento_paternidade"})
-    father_on["municipio_norm"] = father_on["municipio"].apply(normalize_text)
-    father_on["reconhecimento_paternidade"] = pd.to_numeric(father_on["reconhecimento_paternidade"], errors="coerce")
+    father_on = father_on.rename(
+        columns={
+            "Estado": "municipio",
+            "qt_reconhecimento_paternidade": "reconhecimento_paternidade",
+        }
+    )
+    father_on["reconhecimento_paternidade"] = pd.to_numeric(
+        father_on["reconhecimento_paternidade"], errors="coerce"
+    )
     father_on["ano"] = pd.to_numeric(father_on["ano"], errors="coerce")
-    father_on = father_on.groupby(["uf", "municipio_norm", "ano"], as_index=False)["reconhecimento_paternidade"].sum()
 
-    muni_lookup = municipal[["cd_mun", "sigla_uf", "nm_mun_norm"]].drop_duplicates().rename(columns={"sigla_uf": "uf", "nm_mun_norm": "municipio_norm"})
+    # Pareamento por nome (exato + fuzzy) com a malha IBGE, antes de agregar
+    # por municipio-ano. Isso garante que o fuzzy rode sobre nomes unicos e
+    # nao repetidamente por ano-UF.
+    father_off_unique = father_off[["uf", "municipio"]].drop_duplicates()
+    father_on_unique = father_on[["uf", "municipio"]].drop_duplicates()
 
-    father_off = father_off.merge(muni_lookup, on=["uf", "municipio_norm"], how="left")
-    father_on = father_on.merge(muni_lookup, on=["uf", "municipio_norm"], how="left")
+    off_map = _merge_registry_names(
+        father_off_unique, municipal, "municipio", "registro_civil_pais_ausentes"
+    )[["uf", "municipio", "cd_mun"]]
+    on_map = _merge_registry_names(
+        father_on_unique, municipal, "municipio", "registro_civil_reconhecimento"
+    )[["uf", "municipio", "cd_mun"]]
 
-    base = pd.MultiIndex.from_product([municipal["cd_mun"].sort_values().unique(), YEARS], names=["cd_mun", "ano"]).to_frame(index=False)
-    base = base.merge(municipal[["cd_mun", "nm_mun", "sigla_uf", "area_km2"]].drop_duplicates(), on="cd_mun", how="left")
+    father_off = father_off.merge(off_map, on=["uf", "municipio"], how="left")
+    father_on = father_on.merge(on_map, on=["uf", "municipio"], how="left")
 
-    panel = base.merge(father_off[["cd_mun", "ano", "pais_ausentes", "nascimentos"]], on=["cd_mun", "ano"], how="left")
-    panel = panel.merge(father_on[["cd_mun", "ano", "reconhecimento_paternidade"]], on=["cd_mun", "ano"], how="left")
+    # Agregacao por municipio-ano: soma dentro de cd_mun evita duplicidade
+    # caso dois nomes externos diferentes mapeiem para o mesmo municipio IBGE
+    # (o fuzzy pode absorver variantes historicas do nome).
+    father_off = (
+        father_off.dropna(subset=["cd_mun"])
+        .groupby(["cd_mun", "ano"], as_index=False)[["pais_ausentes", "nascimentos"]]
+        .sum(min_count=1)
+    )
+    father_on = (
+        father_on.dropna(subset=["cd_mun"])
+        .groupby(["cd_mun", "ano"], as_index=False)["reconhecimento_paternidade"]
+        .sum(min_count=1)
+    )
+
+    base = pd.MultiIndex.from_product(
+        [municipal["cd_mun"].sort_values().unique(), YEARS], names=["cd_mun", "ano"]
+    ).to_frame(index=False)
+    base = base.merge(
+        municipal[["cd_mun", "nm_mun", "sigla_uf", "area_km2"]].drop_duplicates(),
+        on="cd_mun",
+        how="left",
+    )
+
+    panel = base.merge(father_off, on=["cd_mun", "ano"], how="left")
+    panel = panel.merge(father_on, on=["cd_mun", "ano"], how="left")
     panel["pais_ausentes"] = panel["pais_ausentes"].fillna(0)
     panel["nascimentos"] = panel["nascimentos"].fillna(0)
     panel["reconhecimento_paternidade"] = panel["reconhecimento_paternidade"].fillna(0)
@@ -249,15 +327,36 @@ def extract_censo_covariates() -> pd.DataFrame:
     return censo
 
 
-def harmonize_censo_with_municipal(censo: pd.DataFrame, municipal: gpd.GeoDataFrame) -> pd.DataFrame:
-    muni = municipal[["cd_mun", "sigla_uf", "nm_mun_norm"]].drop_duplicates()
-    censo["nm_mun_norm"] = censo["nome"].apply(normalize_text)
-    merged = censo.merge(muni, left_on=["uf", "nm_mun_norm"], right_on=["sigla_uf", "nm_mun_norm"], how="left")
+def harmonize_censo_with_municipal(
+    censo: pd.DataFrame, municipal: gpd.GeoDataFrame
+) -> pd.DataFrame:
+    """Harmoniza o Censo 2010 com a malha IBGE 2025.
+
+    Usa cruzamento deterministico pelo codigo do IBGE: o ``cd_raw`` de 6
+    digitos das planilhas ``.1.1.xls`` do Censo corresponde exatamente aos
+    seis primeiros digitos do ``cd_mun`` de 7 digitos da malha municipal
+    atual (o 7o digito e o verificador). Portanto nao ha espaco para erro
+    por grafia ou acentuacao.
+    """
+    merged = censo_crosswalk_by_ibge_code(censo, municipal, code_col="cd_raw")
+
+    report = MergeReport()
+    report.exact_matches = int(merged["cd_mun"].notna().sum())
+    report.unmatched = int(merged["cd_mun"].isna().sum())
+    if report.unmatched:
+        unmatched_rows = merged.loc[merged["cd_mun"].isna(), ["uf", "nome", "cd_raw"]]
+        report.unmatched_rows = unmatched_rows.head(50).to_dict(orient="records")
+    _MERGE_REPORTS["censo_2010"] = report
+
     merged["pop_total_2010"] = pd.to_numeric(merged["pop_total"], errors="coerce")
     merged["pop_urbana_2010"] = pd.to_numeric(merged["pop_urbana"], errors="coerce")
     merged["pop_rural_2010"] = pd.to_numeric(merged["pop_rural"], errors="coerce")
-    merged["share_rural_2010"] = merged["pop_rural_2010"] / merged["pop_total_2010"]
-    merged = merged[["cd_mun", "pop_total_2010", "pop_urbana_2010", "pop_rural_2010", "share_rural_2010"]].dropna(subset=["cd_mun"])
+    # Taxa de ruralizacao: indefinida (NaN) quando pop_total e zero ou ausente.
+    total = merged["pop_total_2010"].where(merged["pop_total_2010"] > 0)
+    merged["share_rural_2010"] = merged["pop_rural_2010"] / total
+    merged = merged[
+        ["cd_mun", "pop_total_2010", "pop_urbana_2010", "pop_rural_2010", "share_rural_2010"]
+    ].dropna(subset=["cd_mun"])
     return merged.drop_duplicates(subset=["cd_mun"])
 
 
@@ -377,6 +476,9 @@ def main() -> None:
             "municipios_no_semiarido": int(
                 panel.drop_duplicates("cd_mun")["semi_dum"].sum()
             ),
+            "merge_reports": {
+                key: report.to_dict() for key, report in _MERGE_REPORTS.items()
+            },
         },
         "notes": [
             "Tratamento anual definido por presenca de eolica no municipio com base na data de entrada em operacao da ANEEL.",
