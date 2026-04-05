@@ -8,7 +8,8 @@ For a public and reproducible repository, version:
 - project documentation in `docs/`
 - root files such as `README.md`, `requirements.txt`, `.gitignore` and `run_pipeline.ps1`
 - lightweight final outputs in `data/processed/panel`
-- lightweight CSVs in `data/processed/registro_civil`
+- lightweight CSVs in `data/raw/registro_civil_painel_anual` (cache of the
+  Registro Civil API responses used to rebuild the panel)
 - compact spatial exports in KMZ format in `data/processed/vector_exports`
 
 Do not version:
@@ -25,7 +26,7 @@ The project was validated locally on 2026-04-05 and now includes:
 - `src/bootstrap_raw_data.ps1` for official raw data downloads
 - `run_pipeline.ps1` for the end-to-end build
 
-The main remaining portability point is the geospatial runtime, because the pipeline still requires a Python environment with GDAL-compatible geospatial libraries and access to `ogr2ogr`.
+The main remaining portability point is the geospatial runtime, because the pipeline still requires a Python environment with GDAL-compatible geospatial libraries and access to `ogr2ogr`. The Registro Civil downloads now use Python's standard library (`urllib.request`) instead of `curl.exe`, so the Python stage no longer depends on a Windows-specific binary.
 
 ## What Already Works
 

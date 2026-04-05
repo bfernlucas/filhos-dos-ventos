@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import io
 import json
-import subprocess
 import zipfile
-from pathlib import Path
 from urllib.parse import urlencode
 
 import geopandas as gpd
@@ -14,24 +12,29 @@ from pipeline_config import (
     DATA_PROCESSED_DIR,
     DATA_RAW_DIR,
     NORTHEAST_UFS,
-    RAW_ANEEL_CSV,
-    RAW_GEOBR_DIR,
-    RAW_WIND_KMZ,
-    SEMIARIDO_MUNICIPAL_SHP,
-    WIND_FIELDS,
-    WIND_LAYER,
+    PANEL_YEAR_END,
+    PANEL_YEAR_START,
+    SPILLOVER_BUFFER_M,
 )
-from pipeline_utils import normalize_text, parse_description_table, parse_ptbr_number
+# Reaproveita os loaders do build_spatial_base para manter uma unica fonte de
+# verdade para vento (CEPEL), ANEEL e semiarido (SUDENE). Isso elimina a
+# divergencia anterior entre os dois scripts.
+from build_spatial_base import (
+    load_aneel_points as _load_aneel_points_base,
+    load_municipal_boundaries,
+    load_semiarid_status,
+    load_wind_points,
+)
+from pipeline_utils import http_get_text, normalize_text
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 REGCIV_RAW_DIR = DATA_RAW_DIR / "registro_civil_painel_anual"
 PANEL_OUT_DIR = DATA_PROCESSED_DIR / "panel"
 PANEL_CSV = PANEL_OUT_DIR / "painel_municipio_ano_2016_2025.csv"
 PANEL_PARQUET = PANEL_OUT_DIR / "painel_municipio_ano_2016_2025.parquet"
 PANEL_METADATA = PANEL_OUT_DIR / "painel_municipio_ano_2016_2025_metadata.json"
 
-YEARS = list(range(2016, 2026))
+YEARS = list(range(PANEL_YEAR_START, PANEL_YEAR_END + 1))
 REGISTRY_BASE_URL = "https://transparencia.registrocivil.org.br/api"
 
 
@@ -42,22 +45,11 @@ def ensure_dirs() -> None:
 
 def fetch_csv_text(endpoint: str, params: dict[str, str]) -> str:
     url = f"{REGISTRY_BASE_URL}/{endpoint}?{urlencode(params)}"
-    result = subprocess.run(
-        ["curl.exe", "-s", "-L", url],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    return result.stdout
+    return http_get_text(url)
 
 
 def load_municipal_base() -> gpd.GeoDataFrame:
-    frames = []
-    for uf in NORTHEAST_UFS:
-        shp_path = RAW_GEOBR_DIR / uf / f"{uf}_Municipios_2025.shp"
-        frames.append(gpd.read_file(shp_path))
-    gdf = gpd.GeoDataFrame(pd.concat(frames, ignore_index=True), crs=frames[0].crs)
-    gdf = gdf.rename(
+    gdf = load_municipal_boundaries().rename(
         columns={
             "CD_MUN": "cd_mun",
             "NM_MUN": "nm_mun",
@@ -73,25 +65,9 @@ def load_municipal_base() -> gpd.GeoDataFrame:
 
 
 def load_semiarido_status() -> pd.DataFrame:
-    semi = gpd.read_file(SEMIARIDO_MUNICIPAL_SHP)
-    semi = semi.rename(columns={"CD_GEOCMU": "cd_mun", "Semiarido": "semi_txt"})
-    semi["cd_mun"] = semi["cd_mun"].astype(str).str.zfill(7)
-    semi["semiarido"] = semi["semi_txt"].fillna("").str.upper().eq("SIM").astype(int)
-    return semi[["cd_mun", "semiarido"]].drop_duplicates()
-
-
-def load_wind_points() -> gpd.GeoDataFrame:
-    wind = gpd.read_file(RAW_WIND_KMZ, layer=WIND_LAYER)
-    parsed = pd.DataFrame(wind["description"].apply(parse_description_table).tolist())
-    parsed = parsed[["LAT", "LONG"] + WIND_FIELDS].copy()
-    for col in ["LAT", "LONG"] + WIND_FIELDS:
-        parsed[col] = pd.to_numeric(parsed[col], errors="coerce")
-    out = gpd.GeoDataFrame(
-        pd.concat([wind[["Name"]].reset_index(drop=True), parsed.reset_index(drop=True)], axis=1),
-        geometry=wind.geometry,
-        crs=wind.crs,
-    )
-    return out.rename(columns={"Name": "wind_cell"}).dropna(subset=["geometry"])
+    # Delegamos para o loader oficial em build_spatial_base para garantir que
+    # painel e base espacial compartilhem as mesmas colunas (semi_dum, semi_txt).
+    return load_semiarid_status()
 
 
 def aggregate_wind_to_municipality(municipal: gpd.GeoDataFrame) -> pd.DataFrame:
@@ -105,20 +81,12 @@ def aggregate_wind_to_municipality(municipal: gpd.GeoDataFrame) -> pd.DataFrame:
 
 
 def load_aneel_points() -> gpd.GeoDataFrame:
-    aneel = pd.read_csv(RAW_ANEEL_CSV, sep=";", dtype=str, encoding="latin1")
-    aneel = aneel[(aneel["SigTipoGeracao"] == "EOL") & (aneel["SigUFPrincipal"].isin(NORTHEAST_UFS))].copy()
-
-    aneel["lat"] = aneel["NumCoordNEmpreendimento"].apply(parse_ptbr_number)
-    aneel["lon"] = aneel["NumCoordEEmpreendimento"].apply(parse_ptbr_number)
-    aneel["pot_out_kw"] = aneel["MdaPotenciaOutorgadaKw"].apply(parse_ptbr_number)
-    aneel["pot_fisc_kw"] = aneel["MdaPotenciaFiscalizadaKw"].apply(parse_ptbr_number)
-    aneel["gar_fis_kw"] = aneel["MdaGarantiaFisicaKw"].apply(parse_ptbr_number)
-    aneel["dat_oper"] = pd.to_datetime(aneel["DatEntradaOperacao"], errors="coerce")
-    aneel["ano_oper"] = aneel["dat_oper"].dt.year
-
-    aneel = aneel.dropna(subset=["lat", "lon"]).copy()
-    geom = gpd.points_from_xy(aneel["lon"], aneel["lat"], crs="EPSG:4326")
-    return gpd.GeoDataFrame(aneel, geometry=geom)
+    # Reaproveita o loader da base espacial e apenas enriquece com a data de
+    # operacao (necessaria para construir o tratamento anual).
+    aneel = _load_aneel_points_base().copy()
+    aneel["dat_oper_ts"] = pd.to_datetime(aneel["dat_oper"], errors="coerce")
+    aneel["ano_oper"] = aneel["dat_oper_ts"].dt.year
+    return aneel
 
 
 def build_eolica_flags(municipal: gpd.GeoDataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -131,7 +99,7 @@ def build_eolica_flags(municipal: gpd.GeoDataFrame) -> tuple[pd.DataFrame, pd.Da
         agg = (
             active.groupby("cd_mun")
             .agg(
-                eolica_presenca=("CodCEG", "count"),
+                eolica_presenca=("cod_ceg", "count"),
                 eolica_pot_out_kw=("pot_out_kw", "sum"),
                 eolica_pot_fisc_kw=("pot_fisc_kw", "sum"),
             )
@@ -164,7 +132,7 @@ def build_spillover_50km(municipal: gpd.GeoDataFrame) -> pd.DataFrame:
         return centroids[["cd_mun"]].assign(eolica_pre2016_50km=0)
 
     buffers = pre2016[["geometry"]].copy()
-    buffers["geometry"] = buffers.geometry.buffer(50000)
+    buffers["geometry"] = buffers.geometry.buffer(SPILLOVER_BUFFER_M)
     union_geom = buffers.union_all()
     centroids["eolica_pre2016_50km"] = centroids.geometry.within(union_geom).astype(int)
     return centroids[["cd_mun", "eolica_pre2016_50km"]]
@@ -311,7 +279,8 @@ def main() -> None:
     panel = panel.merge(spill, on="cd_mun", how="left")
     panel = panel.merge(censo, on="cd_mun", how="left")
 
-    panel["semiarido"] = panel["semiarido"].fillna(0).astype(int)
+    panel["semi_txt"] = panel["semi_txt"].fillna("Nao")
+    panel["semi_dum"] = panel["semi_dum"].fillna(0).astype(int)
     panel["eolica_presenca"] = panel["eolica_presenca"].fillna(0).astype(int)
     panel["eolica_pot_out_kw"] = panel["eolica_pot_out_kw"].fillna(0)
     panel["eolica_pot_fisc_kw"] = panel["eolica_pot_fisc_kw"].fillna(0)
@@ -320,8 +289,11 @@ def main() -> None:
     panel["ever_treated"] = panel["ano_primeira_eolica"].notna().astype(int)
     panel["event_time"] = panel["ano"] - panel["ano_primeira_eolica"]
     panel.loc[panel["ano_primeira_eolica"].isna(), "event_time"] = pd.NA
-    panel["tx_pais_ausentes_1000"] = panel["pais_ausentes"] / panel["nascimentos"].where(panel["nascimentos"] > 0) * 1000
-    panel["tx_reconhecimento_1000"] = panel["reconhecimento_paternidade"] / panel["nascimentos"].where(panel["nascimentos"] > 0) * 1000
+    # Taxas por 1.000 nascimentos: quando nao ha nascimentos registrados no
+    # municipio-ano, a taxa e indefinida (NaN) em vez de zero ou infinito.
+    nasc = panel["nascimentos"].where(panel["nascimentos"] > 0)
+    panel["tx_pais_ausentes_1000"] = panel["pais_ausentes"] / nasc * 1000
+    panel["tx_reconhecimento_1000"] = panel["reconhecimento_paternidade"] / nasc * 1000
 
     panel = panel[[
         "cd_mun",
@@ -333,7 +305,8 @@ def main() -> None:
         "nascimentos",
         "tx_pais_ausentes_1000",
         "tx_reconhecimento_1000",
-        "semiarido",
+        "semi_txt",
+        "semi_dum",
         "eolica_presenca",
         "eolica_pot_out_kw",
         "eolica_pot_fisc_kw",
@@ -358,7 +331,8 @@ def main() -> None:
             nascimentos=("nascimentos", "first"),
             tx_pais_ausentes_1000=("tx_pais_ausentes_1000", "first"),
             tx_reconhecimento_1000=("tx_reconhecimento_1000", "first"),
-            semiarido=("semiarido", "first"),
+            semi_txt=("semi_txt", "first"),
+            semi_dum=("semi_dum", "first"),
             eolica_presenca=("eolica_presenca", "first"),
             eolica_pot_out_kw=("eolica_pot_out_kw", "first"),
             eolica_pot_fisc_kw=("eolica_pot_fisc_kw", "first"),
@@ -379,7 +353,7 @@ def main() -> None:
     panel.to_parquet(PANEL_PARQUET, index=False)
 
     metadata = {
-        "years": [2016, 2025],
+        "years": [PANEL_YEAR_START, PANEL_YEAR_END],
         "rows": int(len(panel)),
         "municipios": int(panel["cd_mun"].nunique()),
         "treated_ever": int(panel.drop_duplicates("cd_mun")["ever_treated"].sum()),

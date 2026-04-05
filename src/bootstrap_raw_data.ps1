@@ -24,6 +24,17 @@ function Download-IfMissing {
     Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing
 }
 
+function Resolve-Extractor {
+    param([string]$CommandName, [string[]]$Candidates)
+
+    foreach ($candidate in $Candidates) {
+        if ($candidate -and (Test-Path $candidate)) { return $candidate }
+    }
+    $cmd = Get-Command $CommandName -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    return $null
+}
+
 function Extract-IfMissing {
     param(
         [string]$ArchivePath,
@@ -38,7 +49,41 @@ function Extract-IfMissing {
 
     Ensure-Dir $Destination
     Write-Host "Extraindo: $ArchivePath"
-    tar -xf $ArchivePath -C $Destination
+
+    $extension = [System.IO.Path]::GetExtension($ArchivePath).ToLowerInvariant()
+    switch ($extension) {
+        ".zip" {
+            # Expand-Archive e nativo e cobre os arquivos do IBGE (municipios, UFs, Censo).
+            Expand-Archive -LiteralPath $ArchivePath -DestinationPath $Destination -Force
+        }
+        ".rar" {
+            # tar do Windows/bsdtar nao suporta RAR. Usamos 7-Zip ou UnRAR explicitamente.
+            $sevenZip = Resolve-Extractor "7z" @(
+                $env:SEVENZIP_EXE,
+                "C:\Program Files\7-Zip\7z.exe",
+                "C:\Program Files (x86)\7-Zip\7z.exe"
+            )
+            if ($sevenZip) {
+                & $sevenZip x -y "-o$Destination" $ArchivePath | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw "7-Zip falhou ao extrair $ArchivePath (codigo $LASTEXITCODE)." }
+                return
+            }
+
+            $unrar = Resolve-Extractor "unrar" @($env:UNRAR_EXE, "C:\Program Files\WinRAR\UnRAR.exe")
+            if ($unrar) {
+                & $unrar x -y $ArchivePath "$Destination\" | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw "UnRAR falhou ao extrair $ArchivePath (codigo $LASTEXITCODE)." }
+                return
+            }
+
+            throw "Arquivo .rar detectado ($ArchivePath), mas nenhum extrator foi encontrado. Instale 7-Zip ou UnRAR, ou defina SEVENZIP_EXE/UNRAR_EXE."
+        }
+        default {
+            # Fallback generico para formatos suportados por bsdtar (tar, tar.gz, etc.).
+            tar -xf $ArchivePath -C $Destination
+            if ($LASTEXITCODE -ne 0) { throw "tar falhou ao extrair $ArchivePath (codigo $LASTEXITCODE)." }
+        }
+    }
 }
 
 $ufs = @("AL","BA","CE","MA","PB","PE","PI","RN","SE")

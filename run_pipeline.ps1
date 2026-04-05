@@ -73,18 +73,37 @@ if (($requiredFiles | Where-Object { -not (Test-Path $_) }).Count -gt 0) {
     & (Join-Path $projectRoot "src\bootstrap_raw_data.ps1")
 }
 
-& $pythonExe (Join-Path $projectRoot "src\python\build_spatial_base.py") 2>&1 | Tee-Object -FilePath $logFile
-& $pythonExe (Join-Path $projectRoot "src\python\validate_outputs.py") 2>&1 | Tee-Object -FilePath $logFile -Append
+function Invoke-Step {
+    param(
+        [Parameter(Mandatory = $true)][string]$Executable,
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][string]$LogPath,
+        [switch]$Append
+    )
+
+    if ($Append) {
+        & $Executable @Arguments 2>&1 | Tee-Object -FilePath $LogPath -Append
+    } else {
+        & $Executable @Arguments 2>&1 | Tee-Object -FilePath $LogPath
+    }
+    if ($LASTEXITCODE -ne 0) {
+        throw "Falha ao executar '$Executable $($Arguments -join ' ')' (codigo $LASTEXITCODE). Veja $LogPath."
+    }
+}
+
+Invoke-Step $pythonExe @((Join-Path $projectRoot "src\python\build_spatial_base.py")) $logFile
+Invoke-Step $pythonExe @((Join-Path $projectRoot "src\python\validate_outputs.py")) $logFile -Append
 
 foreach ($f in @($windKml, $windKmz, $aneelKml, $aneelKmz)) {
     if (Test-Path $f) { Remove-Item -LiteralPath $f -Force }
 }
 
-& $ogr2ogrExe -q -f LIBKML $windKml $gpkg wind_points 2>&1 | Tee-Object -FilePath $logFile -Append
-& $ogr2ogrExe -q -f LIBKML $windKmz $gpkg wind_points 2>&1 | Tee-Object -FilePath $logFile -Append
-& $ogr2ogrExe -q -f LIBKML $aneelKml $gpkg aneel_eol_points 2>&1 | Tee-Object -FilePath $logFile -Append
-& $ogr2ogrExe -q -f LIBKML $aneelKmz $gpkg aneel_eol_points 2>&1 | Tee-Object -FilePath $logFile -Append
+# O driver LIBKML do GDAL detecta automaticamente KML vs KMZ pela extensao.
+Invoke-Step $ogr2ogrExe @("-q", "-f", "LIBKML", $windKml, $gpkg, "wind_points") $logFile -Append
+Invoke-Step $ogr2ogrExe @("-q", "-f", "LIBKML", $windKmz, $gpkg, "wind_points") $logFile -Append
+Invoke-Step $ogr2ogrExe @("-q", "-f", "LIBKML", $aneelKml, $gpkg, "aneel_eol_points") $logFile -Append
+Invoke-Step $ogr2ogrExe @("-q", "-f", "LIBKML", $aneelKmz, $gpkg, "aneel_eol_points") $logFile -Append
 
-& $pythonExe (Join-Path $projectRoot "src\python\build_panel_2016_2025.py") 2>&1 | Tee-Object -FilePath $logFile -Append
+Invoke-Step $pythonExe @((Join-Path $projectRoot "src\python\build_panel_2016_2025.py")) $logFile -Append
 
 Write-Host "Pipeline concluido. Veja o log em $logFile"
