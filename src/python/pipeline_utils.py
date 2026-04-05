@@ -9,6 +9,11 @@ from pathlib import Path
 import geopandas as gpd
 import pandas as pd
 
+try:
+    from ftfy import fix_text as _ftfy_fix_text
+except ImportError:  # pragma: no cover - fallback gracioso
+    _ftfy_fix_text = None
+
 
 def parse_ptbr_number(value: object) -> float | None:
     if value is None:
@@ -23,8 +28,29 @@ def parse_ptbr_number(value: object) -> float | None:
         return None
 
 
+def fix_encoding(value: object) -> str:
+    """Corrige mojibake de encoding (UTF-8 lido como Latin-1 etc.).
+
+    Usa ``ftfy.fix_text`` quando disponivel (recomendado) e cai de volta
+    para uma correcao heuristica via encode/decode quando a biblioteca
+    nao esta instalada. E idempotente: textos ja limpos passam intactos.
+    """
+    if value is None:
+        return ""
+    text = str(value)
+    if _ftfy_fix_text is not None:
+        return _ftfy_fix_text(text)
+    # Fallback: tenta corrigir o caso classico Windows (UTF-8 lido como cp1252).
+    if any(marker in text for marker in ("Ã", "Â", "â€")):
+        try:
+            return text.encode("latin-1", errors="strict").decode("utf-8", errors="strict")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            return text
+    return text
+
+
 def normalize_text(value: object) -> str:
-    text = "" if value is None else str(value)
+    text = fix_encoding(value)
     text = unicodedata.normalize("NFKD", text)
     text = "".join(char for char in text if not unicodedata.combining(char))
     return re.sub(r"\s+", " ", text).strip().lower()

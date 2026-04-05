@@ -33,6 +33,27 @@ DEFAULT_FUZZY_SCORER = fuzz.ratio
 DEFAULT_FUZZY_THRESHOLD = 88.0
 
 
+# Crosswalk manual de renomes municipais oficiais entre a nomenclatura usada
+# pelo Registro Civil (ARPEN) e o nome atual na malha IBGE 2025. Todos os
+# casos sao documentados em atos oficiais do IBGE/Assembleias estaduais.
+# Chave: (nome_normalizado_arpen, sigla_uf) -> nome_normalizado_ibge_atual.
+MANUAL_MUNICIPIO_ALIASES: dict[tuple[str, str], str] = {
+    # PB - Santarem -> Joca Claudino (renomeado em 2010, Lei Estadual 9.184/2010).
+    ("santarem", "PB"): "joca claudino",
+    # RN - Boa Saude -> Januario Cicco (Lei Estadual 9.557/2012).
+    ("boa saude", "RN"): "januario cicco",
+    # RN - Acu -> Assu (nome oficial IBGE).
+    ("acu", "RN"): "assu",
+    # RN - Ares -> Ares (grafia antiga Arez). ASCII apos normalize ja e igual.
+    ("arez", "RN"): "ares",
+}
+
+
+def apply_manual_aliases(norm_name: str, uf: str) -> str:
+    """Devolve o nome normalizado canonico considerando aliases manuais."""
+    return MANUAL_MUNICIPIO_ALIASES.get((norm_name, uf), norm_name)
+
+
 @dataclass
 class MergeReport:
     """Resumo auditavel de um merge por nome municipal."""
@@ -130,6 +151,14 @@ def fuzzy_merge_names_within_uf(
 
     left["_norm"] = left[left_name].map(normalize_text)
     right["_norm"] = right[right_name].map(normalize_text)
+
+    # Aplica crosswalk manual de renomes oficiais ANTES do match exato,
+    # de modo que nomes antigos/alternativos da fonte externa apontem
+    # diretamente para o nome IBGE atual.
+    left["_norm"] = [
+        apply_manual_aliases(norm, uf)
+        for norm, uf in zip(left["_norm"], left[uf_col])
+    ]
 
     # 1. Match exato por nome normalizado dentro da UF.
     exact = left.merge(

@@ -25,7 +25,7 @@ from build_spatial_base import (
     load_semiarid_status,
     load_wind_points,
 )
-from pipeline_utils import http_get_text, normalize_text
+from pipeline_utils import fix_encoding, http_get_text, normalize_text
 from merge_utils import (
     MergeReport,
     censo_crosswalk_by_ibge_code,
@@ -233,6 +233,9 @@ def build_registry_panel(municipal: gpd.GeoDataFrame) -> pd.DataFrame:
             "qt_nascimento": "nascimentos",
         }
     )
+    # Corrige mojibake herdado da resposta da API ARPEN antes de qualquer
+    # normalizacao ou matching, garantindo que o metadata fique legivel.
+    father_off["municipio"] = father_off["municipio"].map(fix_encoding)
     father_off["pais_ausentes"] = pd.to_numeric(father_off["pais_ausentes"], errors="coerce")
     father_off["nascimentos"] = pd.to_numeric(father_off["nascimentos"], errors="coerce")
 
@@ -243,6 +246,7 @@ def build_registry_panel(municipal: gpd.GeoDataFrame) -> pd.DataFrame:
             "qt_reconhecimento_paternidade": "reconhecimento_paternidade",
         }
     )
+    father_on["municipio"] = father_on["municipio"].map(fix_encoding)
     father_on["reconhecimento_paternidade"] = pd.to_numeric(
         father_on["reconhecimento_paternidade"], errors="coerce"
     )
@@ -323,6 +327,7 @@ def extract_censo_covariates() -> pd.DataFrame:
         # Mantem apenas o codigo IBGE municipal completo (7 digitos). Valores
         # maiores correspondem a distritos; menores sao ruido de cabecalho.
         df = df[df["cd_raw"].between(1_000_000, 9_999_999, inclusive="both")].copy()
+        df["nome"] = df["nome"].map(fix_encoding)
         rows.append(df.assign(uf=uf))
 
     censo = pd.concat(rows, ignore_index=True)
