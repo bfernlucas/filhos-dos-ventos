@@ -21,7 +21,8 @@ Unidade de observacao:
 - `nascimentos`: total anual de nascimentos observado na base de registro civil.
 - `tx_pais_ausentes_1000`: pais ausentes por mil nascimentos.
 - `tx_reconhecimento_1000`: reconhecimentos por mil nascimentos.
-- `semiarido`: dummy igual a 1 para municipios no semiarido oficial.
+- `semi_dum`: dummy igual a 1 para municipios no semiarido oficial (SUDENE).
+- `semi_txt`: rotulo textual (`Sim`/`Nao`) do semiarido oficial SUDENE.
 - `eolica_presenca`: dummy anual igual a 1 quando o municipio possui eolica em operacao.
 - `eolica_pot_out_kw`: potencia outorgada acumulada no municipio-ano.
 - `eolica_pot_fisc_kw`: potencia fiscalizada acumulada no municipio-ano.

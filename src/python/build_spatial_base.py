@@ -29,6 +29,7 @@ from pipeline_config import (
     WIND_LAYER,
 )
 from pipeline_utils import (
+    concat_geoframes,
     ensure_directories,
     export_shapefile_with_short_names,
     normalize_text,
@@ -44,8 +45,12 @@ def load_municipal_boundaries() -> gpd.GeoDataFrame:
     frames = []
     for uf in NORTHEAST_UFS:
         shp_path = RAW_GEOBR_DIR / uf / f"{uf}_Municipios_2025.shp"
+        if not shp_path.exists():
+            raise FileNotFoundError(
+                f"Shapefile de municipios do IBGE nao encontrado para {uf}: {shp_path}"
+            )
         frames.append(gpd.read_file(shp_path))
-    return gpd.GeoDataFrame(pd.concat(frames, ignore_index=True), crs=frames[0].crs)
+    return concat_geoframes(frames, "municipios IBGE 2025")
 
 
 def load_semiarid_status() -> pd.DataFrame:
@@ -61,8 +66,12 @@ def load_uf_boundaries() -> gpd.GeoDataFrame:
     frames = []
     for uf in NORTHEAST_UFS:
         shp_path = RAW_UFS_DIR / uf / f"{uf}_UF_2025.shp"
+        if not shp_path.exists():
+            raise FileNotFoundError(
+                f"Shapefile de UF do IBGE nao encontrado para {uf}: {shp_path}"
+            )
         frames.append(gpd.read_file(shp_path))
-    ufs = gpd.GeoDataFrame(pd.concat(frames, ignore_index=True), crs=frames[0].crs)
+    ufs = concat_geoframes(frames, "UFs IBGE 2025")
     return ufs.rename(columns={"CD_UF": "cd_uf", "SIGLA_UF": "sigla_uf", "NM_UF": "nm_uf"})
 
 
@@ -239,8 +248,8 @@ def build_municipal_base() -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoD
         "aneel_gf_kw",
         "geometry",
     ]
-    base = base[keep].sort_values(["sigla_uf", "cd_mun"])
-    return gpd.GeoDataFrame(base, geometry="geometry", crs=municipal.crs), wind_points, aneel_points
+    base = base[keep].sort_values(["sigla_uf", "cd_mun"]).reset_index(drop=True)
+    return base, wind_points, aneel_points
 
 
 def export_outputs(base: gpd.GeoDataFrame, wind_points: gpd.GeoDataFrame, aneel_points: gpd.GeoDataFrame) -> None:

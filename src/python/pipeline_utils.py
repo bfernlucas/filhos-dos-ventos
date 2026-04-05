@@ -1,6 +1,8 @@
 import json
 import re
 import unicodedata
+import urllib.error
+import urllib.request
 import warnings
 from pathlib import Path
 
@@ -59,3 +61,25 @@ def to_numeric_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
     for column in columns:
         df[column] = pd.to_numeric(df[column], errors="coerce")
     return df
+
+
+def http_get_text(url: str, timeout: int = 60) -> str:
+    """Baixa o corpo de uma URL como texto.
+
+    Usa apenas a biblioteca padrao para evitar dependencias especificas de
+    plataforma (como ``curl.exe`` no Windows).
+    """
+    request = urllib.request.Request(url, headers={"User-Agent": "filhos-dos-ventos/1.0"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            charset = response.headers.get_content_charset() or "utf-8"
+            return response.read().decode(charset, errors="replace")
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Falha ao baixar {url}: {exc}") from exc
+
+
+def concat_geoframes(frames: list[gpd.GeoDataFrame], context: str) -> gpd.GeoDataFrame:
+    """Concatena uma lista nao vazia de GeoDataFrames preservando o CRS."""
+    if not frames:
+        raise ValueError(f"Lista de GeoDataFrames vazia para: {context}")
+    return gpd.GeoDataFrame(pd.concat(frames, ignore_index=True), crs=frames[0].crs)

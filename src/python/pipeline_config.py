@@ -20,6 +20,13 @@ WIND_LAYER = "Nordeste_Dados_Consolidados"
 NORTHEAST_UFS = ["AL", "BA", "CE", "MA", "PB", "PE", "PI", "RN", "SE"]
 WIND_FIELDS = ["fator_k", "fator_c", "V_50m", "V_80m", "V_100m", "V_120m", "V_150m", "V_200m"]
 
+# Raio do buffer (em metros, SIRGAS 2000 / Polyconic EPSG:5880) usado para
+# identificar spillovers de empreendimentos eolicos vizinhos. 50 km segue a
+# escolha documentada no codebook.
+SPILLOVER_BUFFER_M = 50_000
+PANEL_YEAR_START = 2016
+PANEL_YEAR_END = 2025
+
 INTERIM_WIND_POINTS_CSV = DATA_INTERIM_DIR / "wind_points_nordeste.csv"
 INTERIM_ANEEL_POINTS_CSV = DATA_INTERIM_DIR / "aneel_eol_points_nordeste.csv"
 
@@ -46,7 +53,8 @@ GPKG_LAYERS = {
 
 
 def _find_recursive(root: Path, filename: str) -> Path:
-    matches = list(root.rglob(filename))
+    # Ordenacao garante resultado deterministico entre sistemas de arquivos.
+    matches = sorted(root.rglob(filename))
     if matches:
         return matches[0]
     return root / filename
