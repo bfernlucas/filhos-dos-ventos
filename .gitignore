@@ -1,0 +1,41 @@
+__pycache__/
+*.pyc
+*.pyo
+*.log
+
+.Rhistory
+.RData
+.Rproj.user/
+
+# Legacy and local workspace noise
+Analise espacial/
+Base de dados/
+Desenvolvimento/
+Teoria/
+mapas_ne_share/
+gganim_plot*.png
+*.docx
+
+# Raw and interim data should be recreated by pipeline, not versioned
+data/raw/
+data/interim/
+
+# Logs and result folders are local artifacts
+logs/
+results/
+
+# Processed outputs: ignore everything by default, then keep only lightweight deliverables
+data/processed/*
+!data/processed/panel/
+data/processed/panel/*
+!data/processed/panel/painel_municipio_ano_2016_2025.csv
+!data/processed/panel/painel_municipio_ano_2016_2025.parquet
+!data/processed/panel/painel_municipio_ano_2016_2025_metadata.json
+!data/processed/registro_civil/
+data/processed/registro_civil/*
+!data/processed/registro_civil/nordeste_pais_ausentes_municipios.csv
+!data/processed/registro_civil/nordeste_reconhecimento_paternidade_municipios.csv
+!data/processed/vector_exports/
+data/processed/vector_exports/*
+!data/processed/vector_exports/potencial_eolico_nordeste.kmz
+!data/processed/vector_exports/empreendimentos_eolicos_aneel_nordeste.kmz
