@@ -26,6 +26,10 @@ from rapidfuzz import fuzz, process
 from pipeline_utils import normalize_text
 
 
+# fuzz.ratio (Levenshtein normalizado) e mais estrito que WRatio e evita
+# falsos positivos por substring comum (ex.: "acu" contido em "ipanguacu").
+# Com nomes municipais curtos, esse controle e essencial.
+DEFAULT_FUZZY_SCORER = fuzz.ratio
 DEFAULT_FUZZY_THRESHOLD = 88.0
 
 
@@ -54,21 +58,32 @@ def censo_crosswalk_by_ibge_code(
 ) -> pd.DataFrame:
     """Pareia o Censo 2010 com a malha municipal atual pelo codigo IBGE.
 
-    O codigo do IBGE de 7 digitos e composto por 2 digitos de UF + 5 digitos
-    sequenciais + 1 digito verificador. O codigo de 6 digitos usado nas
-    planilhas ``.1.1.xls`` do Censo 2010 e exatamente o codigo de 7 digitos
-    sem o verificador. Portanto, ``cd_mun[:6] == cd_raw`` e um cruzamento
-    deterministico e sem perdas por grafia.
+    As planilhas ``.1.1.xls`` do Censo 2010 ja publicam o codigo IBGE
+    completo de 7 digitos. O cruzamento portanto e direto contra
+    ``cd_mun`` (tambem 7 digitos) da malha 2025. Linhas com codigos mais
+    longos (9+ digitos) correspondem a distritos/subdivisoes e sao
+    descartadas antes do merge.
     """
     censo = censo.copy()
     censo[code_col] = pd.to_numeric(censo[code_col], errors="coerce").astype("Int64")
+    # Mantem apenas codigos de 7 digitos (1_000_000 a 9_999_999). Acima
+    # disso sao codigos de distritos e subdivisoes.
+    censo = censo[
+        censo[code_col].between(1_000_000, 9_999_999, inclusive="both")
+    ].copy()
 
     muni = municipal[["cd_mun"]].drop_duplicates().copy()
-    muni["cd_mun"] = muni["cd_mun"].astype(str).str.zfill(7)
-    muni["cd_mun_6"] = muni["cd_mun"].str[:6].astype("Int64")
+    muni["cd_mun_int"] = (
+        muni["cd_mun"].astype(str).str.zfill(7).astype("Int64")
+    )
 
-    merged = censo.merge(muni, left_on=code_col, right_on="cd_mun_6", how="left")
-    return merged.drop(columns=["cd_mun_6"])
+    merged = censo.merge(
+        muni[["cd_mun", "cd_mun_int"]],
+        left_on=code_col,
+        right_on="cd_mun_int",
+        how="left",
+    )
+    return merged.drop(columns=["cd_mun_int"])
 
 
 def fuzzy_merge_names_within_uf(
@@ -142,7 +157,7 @@ def fuzzy_merge_names_within_uf(
             continue
         choices = [name for name, _ in candidates]
         match = process.extractOne(
-            row["_norm"], choices, scorer=fuzz.WRatio, score_cutoff=threshold
+            row["_norm"], choices, scorer=DEFAULT_FUZZY_SCORER, score_cutoff=threshold
         )
         if match is None:
             fuzzy_cd.append((idx, pd.NA, None, None))
@@ -225,7 +240,7 @@ def residual_fuzzy_fill(
             continue
         choices = [name for name, _ in candidates]
         match = process.extractOne(
-            row["_norm"], choices, scorer=fuzz.WRatio, score_cutoff=threshold
+            row["_norm"], choices, scorer=DEFAULT_FUZZY_SCORER, score_cutoff=threshold
         )
         if match is None:
             report.unmatched += 1

@@ -151,7 +151,7 @@ def build_spillover_50km(municipal: gpd.GeoDataFrame) -> pd.DataFrame:
 def download_pais_ausentes_year(year: int, uf: str) -> pd.DataFrame:
     out_path = REGCIV_RAW_DIR / f"father_off_{uf}_{year}.csv"
     if out_path.exists():
-        df = pd.read_csv(out_path)
+        df = pd.read_csv(out_path, encoding="utf-8")
         df["uf"] = uf
         df["ano"] = year
         return df
@@ -173,7 +173,7 @@ def download_pais_ausentes_year(year: int, uf: str) -> pd.DataFrame:
 def download_reconhecimento_year(year: int, uf: str) -> pd.DataFrame:
     out_path = REGCIV_RAW_DIR / f"father_on_{uf}_{year}.csv"
     if out_path.exists():
-        df = pd.read_csv(out_path)
+        df = pd.read_csv(out_path, encoding="utf-8")
         df["uf"] = uf
         return df
     params = {
@@ -320,7 +320,9 @@ def extract_censo_covariates() -> pd.DataFrame:
         df.columns = ["nome", "pop_total", "pop_urbana", "pop_rural", "cd_raw"]
         df = df[df["cd_raw"].notna()].copy()
         df["cd_raw"] = pd.to_numeric(df["cd_raw"], errors="coerce")
-        df = df[df["cd_raw"] >= 100000].copy()
+        # Mantem apenas o codigo IBGE municipal completo (7 digitos). Valores
+        # maiores correspondem a distritos; menores sao ruido de cabecalho.
+        df = df[df["cd_raw"].between(1_000_000, 9_999_999, inclusive="both")].copy()
         rows.append(df.assign(uf=uf))
 
     censo = pd.concat(rows, ignore_index=True)
